@@ -1,0 +1,1242 @@
+import * as THREE from "three";
+import gsap from "gsap";
+
+export interface ShowroomCarSpec {
+  id: string;
+  url: string;
+  index: string; // "01"
+  accent: string;
+  /** базовая яркость панели (0.5–1) — для пересвеченных фото */
+  brightness?: number;
+  /**
+   * Арт-дирекшн кропа фото (object-fit: cover с фокусом на автомобиле):
+   * окно в UV-координатах изображения — центр (cx, cy) и ширина w.
+   * Высота окна выводится из аспекта панели. Без указания — авто-cover.
+   */
+  uvCrop?: { cx: number; cy: number; w: number };
+  /** точка кадрирования по вертикали при авто-cover: 0 — низ, 1 — верх */
+  uvFocusY?: number;
+  /** ширина затухания краёв панели (доля ширины/высоты); дефолт — как у остальных панелей */
+  edgeX?: number;
+  edgeY?: number;
+}
+
+export interface ShowroomEngineOptions {
+  container: HTMLElement;
+  cars: ShowroomCarSpec[];
+  onSelect: (id: string) => void;
+  onHoverChange: (id: string | null) => void;
+  onLabels: (labels: { id: string; x: number; y: number; opacity: number }[]) => void;
+  onFocused: () => void;
+  onResetDone: () => void;
+  onProgress: (loaded: number, total: number) => void;
+  onUnsupported: () => void;
+  reducedMotion: boolean;
+  mobile: boolean;
+}
+
+type Phase = "intro" | "idle" | "focusing" | "focused" | "resetting";
+
+interface CarRig {
+  id: string;
+  group: THREE.Group;
+  panel: THREE.Mesh;
+  reflection: THREE.Mesh;
+  material: THREE.ShaderMaterial;
+  reflMaterial: THREE.ShaderMaterial;
+  basePos: THREE.Vector3;
+  baseRotY: number;
+  baseScale: number;
+  pool: THREE.SpotLight;
+  poolBaseColor: THREE.Color;
+  accent: THREE.Color;
+  loaded: boolean;
+}
+
+const PANEL_W = 7.2;
+/** аспект панели 1.5 — нативный для исходных фото, кузов занимает максимум кадра */
+const PANEL_H = 4.8;
+/** единый брейкпоинт с React-слоём (ShowroomStage/Navigation) */
+export const SHOWROOM_BREAKPOINT = 860;
+
+interface PavilionLayout {
+  xs: [number, number, number];
+  ys: [number, number, number];
+  zs: [number, number, number];
+  rotY: [number, number, number];
+  scale: number;
+  floorY: number;
+  camPos: THREE.Vector3;
+  camLook: THREE.Vector3;
+  fov: number;
+}
+
+/**
+ * Десктопный павильон: три автомобиля в одну горизонтальную линию.
+ * Геометрия выводится из аспекта вьюпорта: ряд всегда занимает ~96% ширины
+ * кадра без обрезки боковых машин, линия сидит в нижней половине экрана,
+ * верхняя зона остаётся свободной под заголовок.
+ */
+function computeDesktopLayout(aspect: number): PavilionLayout {
+  const fov = 42;
+  const dist = 11.4;
+  const V = 2 * dist * Math.tan(THREE.MathUtils.degToRad(fov / 2));
+  const W = V * aspect;
+
+  const gap = 0.3;
+  const margin = 0.5;
+  const scale = Math.min((W - 2 * margin - 2 * gap) / 3 / PANEL_W, 0.95);
+  const ph = PANEL_H * scale;
+
+  const yc = 1.62; // высота линии автомобилей
+  const camLookY = yc + 0.085 * V; // панельный центр проецируется ниже середины кадра
+
+  return {
+    xs: [-(PANEL_W * scale) - gap, 0, (PANEL_W * scale) + gap],
+    ys: [yc, yc, yc],
+    zs: [0, 0, 0],
+    rotY: [0.13, 0, -0.13],
+    scale,
+    floorY: yc - ph / 2 - 0.45,
+    camPos: new THREE.Vector3(0, camLookY + 0.6, dist),
+    camLook: new THREE.Vector3(0, camLookY, 0),
+    fov,
+  };
+}
+
+/**
+ * Мобильный павильон: вертикальная последовательная галерея.
+ * Верхние ~23% кадра резервируются под заголовок, панели занимают максимум
+ * ширины, имена моделей проецируются под каждой машиной.
+ */
+function computeMobileLayout(aspect: number): PavilionLayout {
+  const fov = 52;
+  const dist = 12.6;
+  const V = 2 * dist * Math.tan(THREE.MathUtils.degToRad(fov / 2));
+  const W = V * aspect;
+
+  // 3·ph + 2·gap ≈ ≤ 0.65·V → scale ≤ 0.0405·V; учитываем и ширину
+  const scale = Math.min(0.0405 * V, (0.9 * W) / PANEL_W, 0.78);
+  const ph = PANEL_H * scale;
+  const gap = Math.max(0.5, ph * 0.14);
+
+  const top = V * 0.21; // верх первой панели: под заголовочной зоной (~29% кадра)
+  const c1 = top - ph / 2;
+  const c2 = c1 - ph - gap;
+  const c3 = c2 - ph - gap;
+
+  return {
+    xs: [0, 0, 0],
+    ys: [c1, c2, c3],
+    zs: [-0.35, 0, 0.35],
+    rotY: [0, 0, 0],
+    scale,
+    floorY: c3 - ph / 2 - 0.2,
+    camPos: new THREE.Vector3(0, 0.1, dist),
+    camLook: new THREE.Vector3(0, 0, 0),
+    fov,
+  };
+}
+
+/** Ракурс после выбора автомобиля: панель слева, место для UI справа */
+const FOCUS = {
+  panelPos: new THREE.Vector3(-1.55, 1.72, 4.1),
+  panelRotY: 0.16,
+  otherZ: -7.5,
+  camPos: new THREE.Vector3(0.4, 2.05, 11.9),
+  camLook: new THREE.Vector3(-1.2, 1.6, 4.0),
+};
+
+const FOCUS_MOBILE = {
+  panelPos: new THREE.Vector3(0, 1.5, 5.2),
+  panelRotY: 0,
+  otherZ: -8.5,
+  camPos: new THREE.Vector3(0, 1.5, 16.1),
+  camLook: new THREE.Vector3(0, 1.5, 5.2),
+};
+
+const PANEL_VERT = /* glsl */ `
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+const PANEL_FRAG = /* glsl */ `
+  uniform sampler2D uMap;
+  uniform float uOpacity;
+  uniform float uHighlight;
+  uniform float uDim;
+  uniform float uHasMap;
+  uniform float uBaseBright;
+  uniform float uSweep;
+  uniform float uEdgeX;
+  uniform float uEdgeY;
+  uniform vec2 uCoverScale;
+  uniform vec2 uCoverOffset;
+  varying vec2 vUv;
+
+  void main() {
+    // object-fit: cover — фото заполняет панель без растяжения
+    vec2 uv = vUv * uCoverScale + uCoverOffset;
+    vec4 tex = uHasMap > 0.5 ? texture2D(uMap, uv) : vec4(0.08, 0.085, 0.1, 1.0);
+    vec3 col = tex.rgb;
+
+    // мягкое затухание краёв — панель растворяется в пространстве павильона
+    // (ширина зоны — per-car: узкие фото с автомобилем во всю ширину не должны
+    //  растворять кузов в черноте по краям)
+    float ex = smoothstep(0.0, uEdgeX, vUv.x) * smoothstep(1.0, 1.0 - uEdgeX, vUv.x);
+    float ey = smoothstep(0.0, uEdgeY, vUv.y) * smoothstep(1.0, 1.0 - uEdgeY, vUv.y);
+    float edge = ex * ey;
+    edge = pow(edge, 0.9);
+
+    // виньетка: углы уходят в темноту павильона, фото «встраивается» в сцену
+    float vig = 1.0 - smoothstep(0.52, 1.02, length((vUv - 0.5) * vec2(1.2, 1.42)));
+
+    // вертикальный градиент: низ слегка темнее, «встраивание» в пол
+    float vg = mix(0.7, 1.0, smoothstep(0.0, 0.4, vUv.y));
+
+    float bright = mix(0.82, 1.12, uHighlight) * uBaseBright;
+    col = col * vg * bright * uDim * mix(0.68, 1.0, vig);
+
+    // кинематографичный свип: диагональная полоса света пробегает по кузову
+    // uSweep < -0.5 — выключен; 0..1.2 — положение гребня вдоль диагонали
+    float d = vUv.x * 0.62 + (1.0 - vUv.y) * 0.38;
+    float band = exp(-pow((d - uSweep) * 8.5, 2.0));
+    col += vec3(1.0, 0.985, 0.955) * band * 0.22 * uDim * edge;
+
+    gl_FragColor = vec4(col, tex.a * edge * uOpacity);
+    #include <colorspace_fragment>
+  }
+`;
+
+function makePanelMaterial(hasMap: boolean): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    vertexShader: PANEL_VERT,
+    fragmentShader: PANEL_FRAG,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+      uniforms: {
+      uMap: { value: null },
+      uOpacity: { value: 0 },
+      uHighlight: { value: 0 },
+      uDim: { value: 1 },
+      uHasMap: { value: hasMap ? 0 : 0 },
+      uBaseBright: { value: 1 },
+      uEdgeX: { value: 0.07 },
+      uEdgeY: { value: 0.1 },
+      uSweep: { value: -1 },
+      uCoverScale: { value: new THREE.Vector2(1, 1) },
+      uCoverOffset: { value: new THREE.Vector2(0, 0) },
+    },
+  });
+}
+
+function gradientTexture(from: string, to: string): THREE.Texture {
+  const c = document.createElement("canvas");
+  c.width = 64;
+  c.height = 36;
+  const ctx = c.getContext("2d")!;
+  const g = ctx.createLinearGradient(0, 0, 0, 36);
+  g.addColorStop(0, from);
+  g.addColorStop(1, to);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 64, 36);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+export class ShowroomEngine {
+  private opts: ShowroomEngineOptions;
+  private renderer: THREE.WebGLRenderer | null = null;
+  private scene: THREE.Scene;
+  private camera: THREE.PerspectiveCamera;
+  private clock = { elapsedTime: 0 };
+  private lastTime = 0;
+  private rigs: CarRig[] = [];
+  private raycaster = new THREE.Raycaster();
+  private pointerNdc = new THREE.Vector2(0, 0);
+  private pointerActive = false;
+  private hovered: string | null = null;
+  private selected: string | null = null;
+  private phase: Phase = "intro";
+  private raf = 0;
+  private disposed = false;
+  private paused = false;
+  private scrollProgress = 0;
+  private lookTarget = new THREE.Vector3();
+  private hoverSmX = 0;
+  private hoverSmZ = 0;
+  private totalLoaded = 0;
+  private texLoader = new THREE.TextureLoader();
+  private fallbackTextures: THREE.Texture[] = [];
+  private introTl: gsap.core.Timeline | null = null;
+  private focusTl: gsap.core.Timeline | null = null;
+  private pendingSelect: string | null = null;
+  private resizeObs: ResizeObserver | null = null;
+  private io: IntersectionObserver | null = null;
+  private listeners: Array<[EventTarget, string, EventListener]> = [];
+  /** текущая раскладка павильона (пересчитывается при ресайзе) */
+  private layout: PavilionLayout;
+  private isMobileLayout: boolean;
+  private floor: THREE.Mesh | null = null;
+  private grid: THREE.GridHelper | null = null;
+  private lastLayoutKey = "";
+  /** отложенная смена режима (окно изменилось во время перехода) */
+  private pendingRelayout: boolean | null = null;
+
+  constructor(opts: ShowroomEngineOptions) {
+    this.opts = opts;
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color("#060607");
+    this.scene.fog = new THREE.FogExp2("#060607", 0.032);
+
+    this.isMobileLayout = opts.mobile;
+    this.layout = this.computeLayout(
+      opts.mobile,
+      opts.container.clientWidth / Math.max(1, opts.container.clientHeight)
+    );
+
+    this.camera = new THREE.PerspectiveCamera(
+      this.layout.fov,
+      opts.container.clientWidth / Math.max(1, opts.container.clientHeight),
+      0.1,
+      120
+    );
+
+    try {
+      this.renderer = new THREE.WebGLRenderer({
+        antialias: !opts.mobile,
+        alpha: false,
+        powerPreference: "high-performance",
+      });
+    } catch {
+      opts.onUnsupported();
+      return;
+    }
+
+    const dpr = Math.min(window.devicePixelRatio || 1, opts.mobile ? 1.75 : 2);
+    this.renderer.setPixelRatio(dpr);
+    this.renderer.setSize(opts.container.clientWidth, opts.container.clientHeight);
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.12;
+    this.renderer.domElement.style.display = "block";
+    this.renderer.domElement.style.width = "100%";
+    this.renderer.domElement.style.height = "100%";
+    opts.container.appendChild(this.renderer.domElement);
+
+    this.buildEnvironment();
+    this.buildCars();
+    this.bindEvents();
+
+    const layout = this.layout;
+    this.camera.position.copy(opts.reducedMotion ? layout.camPos : layout.camPos.clone().add(new THREE.Vector3(0, 1.1, 3.4)));
+    this.lookTarget.copy(layout.camLook);
+    this.camera.lookAt(this.lookTarget);
+
+    this.phase = "intro";
+    this.animate();
+  }
+
+  private computeLayout(mobile: boolean, aspect: number): PavilionLayout {
+    return mobile ? computeMobileLayout(aspect) : computeDesktopLayout(aspect);
+  }
+
+  /** масштаб панели в фокусе: крупнее стоянки, но вписывающаяся в ракурс FOCUS */
+  private focusScale(): number {
+    return Math.min(Math.max(0.675, this.layout.scale), 0.75);
+  }
+
+  /* ------------------------------------------------------------------ */
+
+  private buildEnvironment() {
+    const floorY = this.layout.floorY;
+    // отражающий тёмный пол
+    const floorGeo = new THREE.PlaneGeometry(220, 220);
+    const floorMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color("#0a0a0c"),
+      roughness: 0.42,
+      metalness: 0.55,
+      transparent: true,
+      opacity: 0.9,
+    });
+    const floor = new THREE.Mesh(floorGeo, floorMat);
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.y = floorY;
+    this.scene.add(floor);
+    this.floor = floor;
+
+    // сетка-разметка павильона: тонкие световые линии, уходящие в глубину
+    const gridHelper = new THREE.GridHelper(160, 80, 0x2c2c33, 0x1a1a1f);
+    (gridHelper.material as THREE.Material).transparent = true;
+    (gridHelper.material as THREE.Material).opacity = 0.32;
+    gridHelper.position.y = floorY + 0.012;
+    this.scene.add(gridHelper);
+    this.grid = gridHelper;
+
+    // общий заполняющий свет
+    this.scene.add(new THREE.AmbientLight(0x9aa3b2, 0.55));
+
+    // световые пулы под каждым автомобилем
+    const poolColors = ["#e8e4da", "#dfe6ee", "#e3dcd2"];
+    for (let i = 0; i < 3; i++) {
+      const spot = new THREE.SpotLight(0xffffff, 60, 30, 0.5, 0.6, 1.6);
+      spot.position.set(0, 8.4, 1.6);
+      spot.visible = true;
+      spot.color = new THREE.Color(poolColors[i]);
+      this.scene.add(spot);
+      this.scene.add(spot.target);
+      this.pools.push(spot);
+    }
+
+    // медленно плывущая атмосферная подсветка фона
+    const backGlow = new THREE.PointLight(0x8ea0c0, 24, 40, 1.8);
+    backGlow.position.set(0, 6.5, -14);
+    this.scene.add(backGlow);
+    this.backGlow = backGlow;
+  }
+
+  private pools: THREE.SpotLight[] = [];
+  private backGlow: THREE.PointLight | null = null;
+
+  private buildCars() {
+    const { xs, ys, zs, rotY, scale } = this.layout;
+
+    const geo = new THREE.PlaneGeometry(PANEL_W, PANEL_H);
+
+    this.opts.cars.forEach((car, i) => {
+      const material = makePanelMaterial(true);
+      material.uniforms.uBaseBright.value = car.brightness ?? 1;
+      material.uniforms.uEdgeX.value = car.edgeX ?? 0.07;
+      material.uniforms.uEdgeY.value = car.edgeY ?? 0.1;
+      const panel = new THREE.Mesh(geo, material);
+
+      const reflMaterial = makePanelMaterial(true);
+      reflMaterial.uniforms.uBaseBright.value = car.brightness ?? 1;
+      reflMaterial.uniforms.uEdgeX.value = car.edgeX ?? 0.07;
+      reflMaterial.uniforms.uEdgeY.value = car.edgeY ?? 0.1;
+      const reflection = new THREE.Mesh(geo, reflMaterial);
+      reflection.scale.y = -1;
+
+      const group = new THREE.Group();
+      group.add(panel);
+      group.add(reflection);
+      this.scene.add(group);
+
+      const basePos = new THREE.Vector3(xs[i], ys[i], zs[i]);
+      group.position.copy(basePos);
+      group.scale.setScalar(scale);
+      panel.position.y = 0;
+      // отражение: зеркалим центр панели относительно плоскости пола
+      reflection.position.y = 2 * this.layout.floorY - basePos.y;
+      group.rotation.y = rotY[i];
+      reflMaterial.uniforms.uMap.value = null;
+
+      const pool = this.pools[i];
+      pool.target.position.set(basePos.x * 0.92, this.layout.floorY, 0);
+      // при включённой анимации пулы разгораются в интро-таймлайне
+      pool.intensity = this.opts.reducedMotion ? 44 : 0;
+
+      let accentColor: THREE.Color;
+      try {
+        accentColor = new THREE.Color(car.accent);
+      } catch {
+        accentColor = new THREE.Color("#d7d9dd");
+      }
+
+      const rig: CarRig = {
+        id: car.id,
+        group,
+        panel,
+        reflection,
+        material,
+        reflMaterial,
+        basePos,
+        baseRotY: rotY[i],
+        baseScale: scale,
+        pool,
+        poolBaseColor: pool.color.clone(),
+        accent: accentColor,
+        loaded: false,
+      };
+      this.rigs.push(rig);
+      this.loadTexture(car, rig);
+    });
+  }
+
+  /** object-fit: cover — фото заполняет панель без растяжения */
+  private applyCoverUniforms(tex: THREE.Texture, mats: THREE.ShaderMaterial[], car: ShowroomCarSpec) {
+    const img = tex.image as { width?: number; height?: number } | undefined;
+    const iw = img?.width ?? 0;
+    const ih = img?.height ?? 0;
+    if (!iw || !ih) return;
+    const imgAspect = iw / ih;
+    const panelAspect = PANEL_W / PANEL_H;
+
+    let sx: number;
+    let sy: number;
+    let ox: number;
+    let oy: number;
+    if (car.uvCrop) {
+      // явное окно кропа (арт-дирекшн под конкретное фото)
+      const { cx, cy, w } = car.uvCrop;
+      sx = w;
+      sy = w * (imgAspect / panelAspect);
+      if (sy > 1) {
+        sy = 1;
+        sx = sy * (panelAspect / imgAspect);
+      }
+      ox = Math.min(Math.max(cx - sx / 2, 0), 1 - sx);
+      oy = Math.min(Math.max(cy - sy / 2, 0), 1 - sy);
+    } else {
+      // авто-cover: обрезаем по центру со смещением фокуса по вертикали
+      sx = imgAspect > panelAspect ? panelAspect / imgAspect : 1;
+      sy = imgAspect > panelAspect ? 1 : imgAspect / panelAspect;
+      ox = (1 - sx) / 2;
+      oy = (1 - sy) * (car.uvFocusY ?? 0.5);
+    }
+    mats.forEach((m) => {
+      m.uniforms.uCoverScale.value.set(sx, sy);
+      m.uniforms.uCoverOffset.value.set(ox, oy);
+    });
+  }
+
+  private loadTexture(car: ShowroomCarSpec, rig: CarRig) {
+    const done = (tex: THREE.Texture | null) => {
+      if (this.disposed) return;
+      this.totalLoaded += 1;
+      this.opts.onProgress(this.totalLoaded, this.opts.cars.length);
+      if (tex) {
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.anisotropy = Math.min(8, this.renderer?.capabilities.getMaxAnisotropy() ?? 1);
+        tex.minFilter = THREE.LinearFilter;
+        rig.material.uniforms.uMap.value = tex;
+        rig.material.uniforms.uHasMap.value = 1;
+        rig.reflMaterial.uniforms.uMap.value = tex;
+        rig.reflMaterial.uniforms.uHasMap.value = 1;
+        this.applyCoverUniforms(tex, [rig.material, rig.reflMaterial], car);
+        rig.loaded = true;
+      }
+      if (this.totalLoaded === this.opts.cars.length) {
+        this.playIntro();
+      }
+    };
+    this.texLoader.load(
+      car.url,
+      (t) => done(t),
+      undefined,
+      () => {
+        // честный fallback: фактурный градиент вместо сломанной картинки
+        const g = gradientTexture("#1b1c22", "#0b0b0e");
+        this.fallbackTextures.push(g);
+        done(g);
+      }
+    );
+  }
+
+  private playIntro() {
+    if (this.disposed) return;
+    const layout = this.layout;
+
+    if (this.opts.reducedMotion) {
+      this.rigs.forEach((rig) => {
+        rig.material.uniforms.uOpacity.value = 1;
+        rig.reflMaterial.uniforms.uOpacity.value = 0.16;
+        rig.pool.intensity = 44;
+      });
+      this.camera.position.copy(layout.camPos);
+      this.phase = "idle";
+      this.applyPendingRelayout();
+      return;
+    }
+
+    this.introTl = gsap.timeline({
+      defaults: { ease: "power3.out" },
+      onComplete: () => {
+        this.phase = "idle";
+        this.applyPendingRelayout();
+      },
+    });
+
+    // стейджинг: автомобили появляются волной, свет разгорается следом,
+    // по кузову пробегает диагональный свип — «включение экспозиции»
+    this.rigs.forEach((rig, i) => {
+      const at = 0.22 + i * 0.17;
+      this.introTl!.to(rig.material.uniforms.uOpacity, { value: 1, duration: 1.35 }, at);
+      this.introTl!.to(
+        rig.material.uniforms.uSweep,
+        { value: 1.25, duration: 1.6, ease: "power2.inOut" },
+        at
+      );
+      this.introTl!.to(rig.reflMaterial.uniforms.uOpacity, { value: 0.16, duration: 1.35 }, at + 0.18);
+      this.introTl!.to(rig.pool, { intensity: 44, duration: 1.5, ease: "power2.out" }, at + 0.1);
+      this.introTl!.set(rig.material.uniforms.uSweep, { value: -1 }, at + 1.75);
+    });
+
+    // камера: мягкий наезд по дуге (выше и левее → рабочая точка)
+    const camFrom = layout.camPos
+      .clone()
+      .add(new THREE.Vector3(1.0, 1.45, 4.1));
+    this.camera.position.copy(camFrom);
+    this.introTl!.to(
+      this.camera.position,
+      { x: layout.camPos.x, y: layout.camPos.y, z: layout.camPos.z, duration: 2.5, ease: "power2.inOut" },
+      0
+    );
+  }
+
+  /* -------------------------- interaction --------------------------- */
+
+  private bindEvents() {
+    const el = this.renderer!.domElement;
+    const container = this.opts.container;
+
+    const onMove = (e: Event) => {
+      const pe = e as PointerEvent;
+      const r = container.getBoundingClientRect();
+      this.pointerNdc.set(
+        ((pe.clientX - r.left) / r.width) * 2 - 1,
+        -((pe.clientY - r.top) / r.height) * 2 + 1
+      );
+      this.pointerActive = true;
+    };
+    el.addEventListener("pointermove", onMove);
+    this.listeners.push([el, "pointermove", onMove]);
+
+    const onLeave = () => {
+      this.pointerActive = false;
+      this.setHover(null);
+    };
+    el.addEventListener("pointerleave", onLeave);
+    this.listeners.push([el, "pointerleave", onLeave]);
+
+    const onClick = (e: Event) => {
+      if (this.phase !== "idle") return;
+      const id = this.pick(e as PointerEvent);
+      if (id) this.select(id);
+    };
+    el.addEventListener("pointerdown", onClick);
+    this.listeners.push([el, "pointerdown", onClick]);
+
+    const onResize = () => this.resize();
+    window.addEventListener("resize", onResize);
+    this.listeners.push([window, "resize", onResize]);
+
+    this.resizeObs = new ResizeObserver(() => this.resize());
+    this.resizeObs.observe(container);
+
+    this.io = new IntersectionObserver(
+      (entries) => {
+        this.paused = !entries[0]?.isIntersecting;
+      },
+      { threshold: 0.02 }
+    );
+    this.io.observe(container);
+  }
+
+  private pick(e: PointerEvent): string | null {
+    const r = this.opts.container.getBoundingClientRect();
+    this.pointerNdc.set(
+      ((e.clientX - r.left) / r.width) * 2 - 1,
+      -((e.clientY - r.top) / r.height) * 2 + 1
+    );
+    this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+    const hits = this.raycaster.intersectObjects(
+      this.rigs.map((rig) => rig.panel),
+      false
+    );
+    if (!hits.length) return null;
+    const rig = this.rigs.find((x) => x.panel === hits[0].object);
+    return rig?.id ?? null;
+  }
+
+  private resize() {
+    if (!this.renderer) return;
+    const w = this.opts.container.clientWidth;
+    const h = this.opts.container.clientHeight;
+    if (!w || !h) return;
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(w, h);
+
+    // реактивная раскладка: смена режима при пересечении брейкпоинта
+    // и пересчёт геометрии при изменении аспекта окна
+    const mobileNow = w <= SHOWROOM_BREAKPOINT;
+    const key = `${mobileNow ? "m" : "d"}:${w}x${h}`;
+    if (key === this.lastLayoutKey) return;
+    this.lastLayoutKey = key;
+    if (this.phase === "idle") {
+      this.applyLayoutMode(mobileNow);
+    } else {
+      this.pendingRelayout = mobileNow;
+    }
+  }
+
+  /** Пересчёт раскладки под текущий режим и аспект окна */
+  private applyLayoutMode(mobile: boolean) {
+    this.isMobileLayout = mobile;
+    const aspect = this.opts.container.clientWidth / Math.max(1, this.opts.container.clientHeight);
+    this.layout = this.computeLayout(mobile, aspect);
+    this.camera.fov = this.layout.fov;
+    this.camera.updateProjectionMatrix();
+    this.applyLayoutToScene();
+  }
+
+  /** Применение текущей раскладки к полу, сетке и стоянкам автомобилей */
+  private applyLayoutToScene() {
+    const { xs, ys, zs, rotY, scale, floorY } = this.layout;
+    if (this.floor) this.floor.position.y = floorY;
+    if (this.grid) this.grid.position.y = floorY + 0.012;
+    this.rigs.forEach((rig, i) => {
+      rig.basePos.set(xs[i], ys[i], zs[i]);
+      rig.baseRotY = rotY[i];
+      rig.baseScale = scale;
+      if (this.phase === "idle") {
+        gsap.killTweensOf(rig.group.position);
+        gsap.killTweensOf(rig.group.scale);
+        gsap.killTweensOf(rig.group.rotation);
+        rig.group.position.copy(rig.basePos);
+        rig.group.rotation.y = rig.baseRotY;
+        rig.group.scale.setScalar(scale);
+      }
+      rig.pool.target.position.set(xs[i] * 0.92, floorY, 0);
+    });
+  }
+
+  /** Отложенная смена раскладки — применяется, когда сцена вернулась в idle */
+  private applyPendingRelayout() {
+    if (this.pendingRelayout === null) return;
+    const mobile = this.pendingRelayout;
+    this.pendingRelayout = null;
+    this.applyLayoutMode(mobile);
+  }
+
+  private setHover(id: string | null) {
+    if (this.hovered === id) return;
+    this.hovered = id;
+    this.opts.onHoverChange(id);
+    const idle = this.phase === "idle";
+    this.rigs.forEach((rig) => {
+      const active = rig.id === id && idle;
+      const target = active ? 1 : 0;
+      gsap.to(rig.material.uniforms.uHighlight, { value: target, duration: 0.5, ease: "power2.out" });
+      if (idle) {
+        gsap.to(rig.pool, { intensity: rig.id === id ? 70 : 44, duration: 0.6 });
+        // пул света подсвечивается акцентом автомобиля — микровзаимодействие
+        const c = active
+          ? rig.accent.clone().lerp(new THREE.Color("#ffffff"), 0.45)
+          : rig.poolBaseColor;
+        gsap.to(rig.pool.color, { r: c.r, g: c.g, b: c.b, duration: 0.55, ease: "power2.out" });
+        // деликатный микромасштаб панели
+        const s = rig.baseScale * (active ? 1.018 : 1);
+        gsap.to(rig.group.scale, { x: s, y: s, z: s, duration: 0.55, ease: "power2.out" });
+      }
+    });
+  }
+
+  /* ----------------------------- API -------------------------------- */
+
+  /**
+   * Мгновенный возврат всех машин на базовые позиции (без анимации).
+   * Используется при перехвате незавершённого перехода.
+   */
+  private snapToPavilion() {
+    const { floorY } = this.layout;
+    this.focusTl?.kill();
+    gsap.killTweensOf(this.camera.position);
+    gsap.killTweensOf(this.lookTarget);
+    this.rigs.forEach((rig) => {
+      gsap.killTweensOf(rig.group.position);
+      gsap.killTweensOf(rig.group.scale);
+      gsap.killTweensOf(rig.group.rotation);
+      rig.group.position.copy(rig.basePos);
+      rig.group.rotation.y = rig.baseRotY;
+      rig.group.scale.setScalar(rig.baseScale);
+      rig.material.uniforms.uOpacity.value = 1;
+      rig.material.uniforms.uDim.value = 1;
+      rig.material.uniforms.uHighlight.value = 0;
+      rig.material.uniforms.uSweep.value = -1;
+      rig.reflMaterial.uniforms.uOpacity.value = 0.16;
+      rig.pool.intensity = 44;
+      rig.pool.color.copy(rig.poolBaseColor);
+      rig.pool.target.position.set(rig.basePos.x * 0.92, floorY, 0);
+    });
+    this.camera.position.copy(this.layout.camPos);
+    this.lookTarget.copy(this.layout.camLook);
+    this.camera.fov = this.layout.fov;
+    this.camera.updateProjectionMatrix();
+    this.phase = "idle";
+    this.pendingSelect = null;
+  }
+
+  /**
+   * Кинематографичный выбор автомобиля: свет → проезд по дуге → посадка камеры.
+   * Устойчив к прерываниям: вызов в фазе resetting ставит выбор в очередь,
+   * в фазе focusing/focused — мгновенно возвращает павильон и начинает заново.
+   */
+  select(id: string) {
+    if (this.phase === "intro" || this.disposed) return;
+    if (this.phase === "resetting") {
+      this.pendingSelect = id;
+      return;
+    }
+    if (this.phase === "focusing" || this.phase === "focused") {
+      // эхо синхронизации (тот же автомобиль) — не перезапускаем хореографию
+      if (this.selected === id) return;
+      this.snapToPavilion();
+    }
+    if (this.phase !== "idle") return;
+    this.phase = "focusing";
+    this.selected = id;
+    this.setHover(null);
+    this.opts.onSelect(id);
+
+    const mobile = this.isMobileLayout;
+    const focus = mobile ? FOCUS_MOBILE : FOCUS;
+    const layout = this.layout;
+    const sel = this.rigs.find((r) => r.id === id)!;
+    const others = this.rigs.filter((r) => r.id !== id);
+
+    this.focusTl?.kill();
+    gsap.killTweensOf(this.camera.position);
+    gsap.killTweensOf(this.lookTarget);
+
+    if (this.opts.reducedMotion) {
+      sel.group.position.copy(focus.panelPos);
+      sel.group.rotation.y = focus.panelRotY;
+      if (!mobile) sel.group.scale.setScalar(this.focusScale());
+      sel.material.uniforms.uOpacity.value = 1;
+      sel.material.uniforms.uHighlight.value = 0.55;
+      sel.material.uniforms.uDim.value = 1;
+      sel.pool.intensity = 90;
+      sel.pool.target.position.set(focus.panelPos.x * 0.6, layout.floorY, focus.panelPos.z);
+      others.forEach((rig) => {
+        rig.group.position.set(rig.basePos.x, rig.basePos.y * 0.9, focus.otherZ);
+        rig.material.uniforms.uOpacity.value = 0.3;
+        rig.reflMaterial.uniforms.uOpacity.value = 0.05;
+        rig.material.uniforms.uDim.value = 0.55;
+        rig.pool.intensity = 6;
+      });
+      this.camera.position.copy(focus.camPos);
+      this.lookTarget.copy(focus.camLook);
+      this.phase = "focused";
+      this.opts.onFocused();
+      return;
+    }
+
+    const tl = gsap.timeline({
+      defaults: { ease: "power2.inOut" },
+      onComplete: () => {
+        this.phase = "focused";
+        this.opts.onFocused();
+      },
+    });
+    this.focusTl = tl;
+
+    /* БИТ 1 (0–0.9): камера отъезжает и приподнимается, свет перекидывается
+       на выбранную машину — зритель понимает, ЧТО сейчас произойдёт */
+    tl.to(
+      this.camera.position,
+      { x: layout.camPos.x * 0.55, y: layout.camPos.y + 0.9, z: layout.camPos.z + 2.2, duration: 0.95 },
+      0
+    );
+    tl.to(this.lookTarget, { y: layout.camLook.y + 0.2, duration: 0.95 }, 0);
+    tl.to(sel.pool, { intensity: 82, duration: 0.8 }, 0);
+    const baseFov = this.camera.fov;
+    if (!mobile) {
+      tl.to(
+        this.camera,
+        {
+          fov: baseFov + 1.8,
+          duration: 0.95,
+          onUpdate: () => this.camera.updateProjectionMatrix(),
+        },
+        0
+      );
+    }
+
+    /* остальные уходят в глубину и тень */
+    others.forEach((rig) => {
+      tl.to(rig.group.position, { z: focus.otherZ, y: rig.basePos.y * 0.9, duration: 1.3 }, 0.1);
+      tl.to(rig.material.uniforms.uOpacity, { value: 0.22, duration: 1.0 }, 0);
+      tl.to(rig.reflMaterial.uniforms.uOpacity, { value: 0.04, duration: 1.0 }, 0);
+      tl.to(rig.material.uniforms.uDim, { value: 0.5, duration: 1.0 }, 0);
+      tl.to(rig.pool, { intensity: 5, duration: 0.7 }, 0);
+    });
+
+    /* БИТ 2 (0.5–2.35): проезд по квадратичной Безье — траектория вынесена
+       к камере, машина «проходит мимо зрителя», пул света следует за ней */
+    const start = sel.group.position.clone();
+    const ctrl = new THREE.Vector3(
+      (start.x + focus.panelPos.x) / 2 + (start.x >= focus.panelPos.x ? -1.15 : 1.15),
+      Math.max(start.y, focus.panelPos.y) + 0.16,
+      Math.max(start.z, focus.panelPos.z) + 2.5
+    );
+    const drive = { t: 0 };
+    tl.to(
+      drive,
+      {
+        t: 1,
+        duration: mobile ? 1.5 : 1.85,
+        ease: "power2.inOut",
+        onUpdate: () => {
+          const a = start.clone().lerp(ctrl, drive.t);
+          const b = ctrl.clone().lerp(focus.panelPos, drive.t);
+          const pos = a.lerp(b, drive.t);
+          sel.group.position.copy(pos);
+          sel.pool.target.position.set(pos.x * 0.6, layout.floorY, pos.z);
+        },
+      },
+      0.5
+    );
+    // доворот корпуса: живой «бросок» в начале движения и доводка в конце
+    const swing = mobile ? 0 : start.x >= focus.panelPos.x ? 0.1 : -0.1;
+    tl.to(sel.group.rotation, { y: focus.panelRotY + swing, duration: 0.95, ease: "power2.out" }, 0.5);
+    tl.to(sel.group.rotation, { y: focus.panelRotY, duration: 0.75, ease: "power2.inOut" }, 1.55);
+    // выбранная машина укрупняется — читается как главный герой кадра
+    if (!mobile) {
+      const focusScale = this.focusScale();
+      tl.to(sel.group.scale, { x: focusScale, y: focusScale, z: focusScale, duration: 1.6, ease: "power2.inOut" }, 0.45);
+    }
+    // свип света по кузову во время проезда
+    tl.fromTo(
+      sel.material.uniforms.uSweep,
+      { value: -0.25 },
+      { value: 1.25, duration: 1.45, ease: "power1.inOut" },
+      0.55
+    );
+    tl.set(sel.material.uniforms.uSweep, { value: -1 }, 2.4);
+    tl.to(sel.material.uniforms.uHighlight, { value: 0.55, duration: 1.1 }, 0.65);
+
+    /* БИТ 3 (1.35–2.5): камера ныряет в финальный трёхчетвертной ракурс */
+    tl.to(
+      this.camera.position,
+      { x: focus.camPos.x, y: focus.camPos.y, z: focus.camPos.z, duration: 1.15, ease: "power3.inOut" },
+      1.35
+    );
+    tl.to(
+      this.lookTarget,
+      { x: focus.camLook.x, y: focus.camLook.y, z: focus.camLook.z, duration: 1.15, ease: "power3.inOut" },
+      1.35
+    );
+    if (!mobile) {
+      tl.to(
+        this.camera,
+        {
+          fov: baseFov,
+          duration: 1.15,
+          ease: "power3.inOut",
+          onUpdate: () => this.camera.updateProjectionMatrix(),
+        },
+        1.35
+      );
+    }
+
+    /* БИТ 4 (2.35–2.8): микроклевок «торможения» — вес переносится вперёд
+       и возвращается; финальная точка совпадает с focus.panelPos */
+    if (!mobile) {
+      tl.to(sel.group.position, { z: focus.panelPos.z + 0.09, duration: 0.17, ease: "power1.out" }, 2.37);
+      tl.to(sel.group.position, { z: focus.panelPos.z, duration: 0.3, ease: "power2.inOut" }, 2.54);
+      tl.to(sel.pool.target.position, { z: focus.panelPos.z, duration: 0.3 }, 2.54);
+    }
+  }
+
+  /**
+   * Запрос возврата к павильону из React-слоя (источник истины — activeCar).
+   * Никогда не блокирует пользовательский путь: если презентация не открыта,
+   * ничего не делает.
+   */
+  requestReset() {
+    if (this.disposed) return;
+    if (this.phase === "focused") this.reset();
+  }
+
+  /** Завершение сброса: возврат в idle и запуск отложенных операций */
+  private finishResetToIdle() {
+    this.phase = "idle";
+    this.applyPendingRelayout();
+    this.opts.onResetDone();
+    if (this.pendingSelect) {
+      const id = this.pendingSelect;
+      this.pendingSelect = null;
+      this.select(id);
+    }
+  }
+
+  /** Возврат ко всем автомобилям: машины возвращаются по дугам со стаггером */
+  reset() {
+    if (this.phase !== "focused" || this.disposed) return;
+    this.phase = "resetting";
+    this.selected = null;
+    const mobile = this.isMobileLayout;
+    const layout = this.layout;
+
+    this.focusTl?.kill();
+    gsap.killTweensOf(this.camera.position);
+    gsap.killTweensOf(this.lookTarget);
+
+    if (this.opts.reducedMotion) {
+      this.rigs.forEach((rig) => {
+        rig.group.position.copy(rig.basePos);
+        rig.group.rotation.y = rig.baseRotY;
+        rig.material.uniforms.uOpacity.value = 1;
+        rig.material.uniforms.uDim.value = 1;
+        rig.material.uniforms.uHighlight.value = 0;
+        rig.reflMaterial.uniforms.uOpacity.value = 0.16;
+        rig.pool.intensity = 44;
+        rig.pool.color.copy(rig.poolBaseColor);
+        rig.group.scale.setScalar(rig.baseScale);
+        rig.pool.target.position.set(rig.basePos.x * 0.92, layout.floorY, 0);
+      });
+      this.camera.position.copy(layout.camPos);
+      this.lookTarget.copy(layout.camLook);
+      this.camera.fov = layout.fov;
+      this.camera.updateProjectionMatrix();
+      this.finishResetToIdle();
+      return;
+    }
+
+    const tl = gsap.timeline({
+      defaults: { ease: "power2.inOut" },
+      onComplete: () => this.finishResetToIdle(),
+    });
+    this.focusTl = tl;
+
+    /* камера первой уходит вверх-назад, затем мягко опускается в рабочую точку */
+    tl.to(
+      this.camera.position,
+      { x: layout.camPos.x * 0.6, y: layout.camPos.y + 0.7, z: layout.camPos.z + 1.3, duration: 0.75 },
+      0
+    );
+    tl.to(
+      this.camera.position,
+      { x: layout.camPos.x, y: layout.camPos.y, z: layout.camPos.z, duration: 0.95, ease: "power2.out" },
+      0.75
+    );
+    tl.to(this.lookTarget, { x: layout.camLook.x, y: layout.camLook.y, z: layout.camLook.z, duration: 1.5 }, 0);
+    const baseFov = this.camera.fov;
+    if (!mobile && this.camera.fov !== baseFov) {
+      tl.to(
+        this.camera,
+        { fov: baseFov, duration: 0.9, onUpdate: () => this.camera.updateProjectionMatrix() },
+        0
+      );
+    }
+
+    this.rigs.forEach((rig, i) => {
+      const to = rig.basePos.clone();
+      const from = rig.group.position.clone();
+      // приподнятая дуга возврата — мягкая «перестановка на место»
+      const ctrl = new THREE.Vector3(
+        (from.x + to.x) / 2,
+        Math.max(from.y, to.y) + 0.28,
+        (from.z + to.z) / 2 + 1.1
+      );
+      const ret = { t: 0 };
+      const at = 0.18 + i * 0.08;
+      tl.to(
+        ret,
+        {
+          t: 1,
+          duration: 1.25,
+          ease: "power2.inOut",
+          onUpdate: () => {
+            const a = from.clone().lerp(ctrl, ret.t);
+            const b = ctrl.clone().lerp(to, ret.t);
+            rig.group.position.copy(a.lerp(b, ret.t));
+          },
+        },
+        at
+      );
+      tl.to(rig.group.rotation, { y: rig.baseRotY, duration: 1.15 }, at);
+      tl.to(rig.material.uniforms.uOpacity, { value: 1, duration: 0.9 }, at + 0.15);
+      tl.to(rig.material.uniforms.uDim, { value: 1, duration: 0.9 }, at + 0.15);
+      tl.to(rig.reflMaterial.uniforms.uOpacity, { value: 0.16, duration: 0.9 }, at + 0.15);
+      tl.to(rig.material.uniforms.uHighlight, { value: 0, duration: 0.6 }, at);
+      tl.to(rig.pool, { intensity: 44, duration: 1.0 }, at + 0.1);
+      tl.to(rig.pool.color, { r: rig.poolBaseColor.r, g: rig.poolBaseColor.g, b: rig.poolBaseColor.b, duration: 0.8 }, at);
+      tl.to(rig.group.scale, { x: rig.baseScale, y: rig.baseScale, z: rig.baseScale, duration: 0.7 }, at);
+      tl.to(rig.pool.target.position, { x: rig.basePos.x * 0.92, z: 0, duration: 1.0 }, at + 0.1);
+      // прощальный свип света — машина «возвращается в экспозицию»
+      tl.fromTo(
+        rig.material.uniforms.uSweep,
+        { value: -0.2 },
+        { value: 0.95, duration: 1.0, ease: "power1.inOut" },
+        at + 0.2
+      );
+      tl.set(rig.material.uniforms.uSweep, { value: -1 }, at + 1.5);
+    });
+  }
+
+  /** Прогресс прокрутки 0..1 — камера поднимается, сцена гаснет */
+  setScrollProgress(p: number) {
+    this.scrollProgress = Math.max(0, Math.min(1, p));
+  }
+
+  isBusy() {
+    return this.phase === "focusing" || this.phase === "resetting";
+  }
+
+  isIdle() {
+    return this.phase === "idle";
+  }
+
+  dispose() {
+    this.disposed = true;
+    cancelAnimationFrame(this.raf);
+    this.introTl?.kill();
+    this.focusTl?.kill();
+    this.listeners.forEach(([t, name, fn]) => t.removeEventListener(name, fn));
+    this.listeners = [];
+    this.resizeObs?.disconnect();
+    this.io?.disconnect();
+    this.rigs.forEach((rig) => {
+      rig.panel.geometry.dispose();
+      rig.material.dispose();
+      rig.reflMaterial.dispose();
+      const map = rig.material.uniforms.uMap.value as THREE.Texture | null;
+      map?.dispose();
+    });
+    this.fallbackTextures.forEach((t) => t.dispose());
+    this.scene.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) {
+        obj.geometry.dispose();
+        const m = obj.material as THREE.Material | THREE.Material[];
+        if (Array.isArray(m)) m.forEach((x) => x.dispose());
+        else m.dispose();
+      }
+      if (obj instanceof THREE.SpotLight || obj instanceof THREE.PointLight) {
+        obj.dispose();
+      }
+    });
+    this.renderer?.dispose();
+    if (this.renderer?.domElement.parentElement) {
+      this.renderer.domElement.parentElement.removeChild(this.renderer.domElement);
+    }
+  }
+
+  /* ---------------------------- render ------------------------------ */
+
+  private animate = () => {
+    if (this.disposed) return;
+    this.raf = requestAnimationFrame(this.animate);
+    if (this.paused) return;
+
+    const dt = Math.min(0.05, this.lastTime ? (performance.now() / 1000 - this.lastTime) : 0.016);
+    this.lastTime = performance.now() / 1000;
+    this.clock.elapsedTime += dt;
+    const t = this.clock.elapsedTime;
+    const reduced = this.opts.reducedMotion;
+    const mobile = this.isMobileLayout;
+    const layout = this.layout;
+
+    // скролл-прогресс поднимает камеру и гасит сцену
+    const sp = this.scrollProgress;
+
+    // пружина смещения камеры при наведении
+    let hx = 0;
+    let hz = 0;
+    if (this.phase === "idle" && this.hovered && !reduced) {
+      const rig = this.rigs.find((r) => r.id === this.hovered);
+      if (rig) {
+        hx = rig.basePos.x * 0.3;
+        hz = -0.9;
+      }
+    }
+    const k = Math.min(1, dt * 3.2);
+    this.hoverSmX += (hx - this.hoverSmX) * k;
+    this.hoverSmZ += (hz - this.hoverSmZ) * k;
+
+    // медленный дрейф камеры + параллакс мыши
+    let driftX = 0;
+    let driftY = 0;
+    if (!reduced && this.phase === "idle") {
+      driftX = Math.sin(t * 0.1) * 0.4 + (this.pointerActive ? this.pointerNdc.x * 0.55 : 0);
+      driftY = Math.sin(t * 0.07) * 0.1 + (this.pointerActive ? this.pointerNdc.y * 0.28 : 0);
+    } else if (!reduced && this.phase === "focused") {
+      driftX = (this.pointerActive ? this.pointerNdc.x * 0.22 : 0);
+      driftY = (this.pointerActive ? this.pointerNdc.y * 0.12 : 0);
+    }
+
+    // GSAP управляет камерой в переходах (intro/focusing/resetting);
+    // в стационарных фазах — дрейф + пружина + скролл-офсеты
+    const gsapOwnsCamera = this.phase === "intro" || this.phase === "focusing" || this.phase === "resetting";
+    if (!gsapOwnsCamera) {
+      if (this.phase === "idle" || this.phase === "intro") {
+        this.camera.position.set(
+          layout.camPos.x + driftX + this.hoverSmX + sp * 0.9,
+          layout.camPos.y + driftY + sp * 2.6,
+          layout.camPos.z + this.hoverSmZ + sp * 2.2
+        );
+        const look = layout.camLook;
+        this.lookTarget.set(look.x + driftX * 0.3, look.y - sp * 1.2, look.z);
+      } else if (this.phase === "focused") {
+        const focus = mobile ? FOCUS_MOBILE : FOCUS;
+        this.camera.position.set(
+          focus.camPos.x + driftX + sp * 0.55,
+          focus.camPos.y + driftY + sp * 2.6,
+          focus.camPos.z + sp * 2.2
+        );
+        const look = focus.camLook;
+        this.lookTarget.set(look.x + driftX * 0.3, look.y - sp * 1.2, look.z);
+      }
+    }
+    this.camera.lookAt(this.lookTarget);
+
+    // «дыхание» панелей в экспозиции — сцена живёт даже без действий зрителя
+    if ((this.phase === "idle" || this.phase === "intro") && !reduced && !gsapOwnsCamera) {
+      this.rigs.forEach((rig, i) => {
+        rig.group.position.y = rig.basePos.y + Math.sin(t * 0.55 + i * 2.1) * 0.026;
+      });
+    }
+
+    // hover: подсветка; смещение камеры считаем каждый кадр как пружину
+    if (this.phase === "idle" && this.pointerActive) {
+      const id = this.pickFromPointer();
+      this.setHover(id);
+    }
+
+    // затухание по скроллу + сгущение павильонной дымки — сцена «уходит вглубь»
+    const fog = this.scene.fog;
+    if (fog instanceof THREE.FogExp2) {
+      fog.density = 0.032 + sp * 0.014;
+    }
+    this.rigs.forEach((rig) => {
+      const baseDim = this.phase === "focused" && this.selected !== rig.id ? 0.55 : 1;
+      rig.material.uniforms.uDim.value = baseDim * (1 - sp * 0.55);
+    });
+
+    // атмосферная подсветка медленно дышит
+    if (this.backGlow && !reduced) {
+      this.backGlow.intensity = 20 + Math.sin(t * 0.4) * 6;
+    }
+
+    // проецируем метки автомобилей в экранные координаты
+    if (this.phase === "idle" || this.phase === "intro") {
+      const labels = this.rigs.map((rig) => {
+        const v = rig.basePos.clone();
+        v.y -= PANEL_H * rig.baseScale * 0.5 + 0.4;
+        v.project(this.camera);
+        return {
+          id: rig.id,
+          x: (v.x * 0.5 + 0.5) * 100,
+          y: (-v.y * 0.5 + 0.5) * 100,
+          opacity: rig.loaded ? 1 : 0,
+        };
+      });
+      this.opts.onLabels(labels);
+    }
+
+    this.renderer!.render(this.scene, this.camera);
+  };
+
+  private pickFromPointer(): string | null {
+    this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+    const hits = this.raycaster.intersectObjects(this.rigs.map((r) => r.panel), false);
+    if (!hits.length) return null;
+    return this.rigs.find((r) => r.panel === hits[0].object)?.id ?? null;
+  }
+}
